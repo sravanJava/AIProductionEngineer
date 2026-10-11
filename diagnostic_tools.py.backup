@@ -1,0 +1,82 @@
+def check_kafka_lag(lag: int) -> dict:
+    """Classify a supplied Kafka lag value."""
+
+    if lag >= 10_000:
+        status = "critical"
+        finding = "Kafka consumer lag is very high."
+    elif lag >= 1_000:
+        status = "warning"
+        finding = "Kafka consumer lag is elevated."
+    else:
+        status = "normal"
+        finding = "Kafka consumer lag is within the prototype's normal range."
+
+    return {
+        "tool": "check_kafka_lag",
+        "simulated": True,
+        "status": status,
+        "lag": lag,
+        "finding": finding,
+    }
+
+
+def inspect_incident(service: str, problem: str) -> dict:
+    """
+    Return simulated evidence for supported services.
+    No real infrastructure is queried.
+    """
+
+    service_name = service.strip().lower()
+    description = problem.lower()
+
+    if service_name == "kafka-consumer":
+        if "10000" in description or "10,000" in description:
+            return check_kafka_lag(10_000)
+
+        if "1000" in description or "1,000" in description:
+            return check_kafka_lag(1_000)
+
+        if "lag" in description:
+            return check_kafka_lag(100)
+
+        return {
+            "tool": "inspect_incident",
+            "simulated": True,
+            "status": "unknown",
+            "finding": (
+                "No numeric Kafka lag was supplied. "
+                "Check consumer lag, processing rate, and broker health."
+            ),
+        }
+
+    if service_name == "payment-service":
+        return {
+            "tool": "inspect_incident",
+            "simulated": True,
+            "status": "unknown",
+            "finding": (
+                "No payment-service telemetry is connected. "
+                "Check error rate, latency, dependency health, and logs."
+            ),
+        }
+
+    if service_name == "api-service":
+        return {
+            "tool": "inspect_incident",
+            "simulated": True,
+            "status": "unknown",
+            "finding": (
+                "No API telemetry is connected. "
+                "Check HTTP 5xx rate, latency, request volume, and logs."
+            ),
+        }
+
+    return {
+        "tool": "inspect_incident",
+        "simulated": True,
+        "status": "unknown",
+        "finding": (
+            "This service is not configured. "
+            "Add a service-specific diagnostic tool before drawing conclusions."
+        ),
+    }

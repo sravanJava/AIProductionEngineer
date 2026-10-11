@@ -1,0 +1,110 @@
+import requests
+
+from adaptive_policy import build_task_policy, validate_policy
+from diagnostic_tools import inspect_incident
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:latest"
+
+
+def investigate_with_agent(
+    service: str,
+    problem: str,
+    previous_incidents: list[dict] | None = None,
+) -> dict:
+    """Investigate an incident under a validated adaptive policy."""
+
+    # 1. Select and validate the task-specific policy.
+    policy = build_task_policy(service)
+    validation = validate_policy(policy)
+
+    if not validation["valid"]:
+        raise ValueError(f"Agent policy rejected: {validation['errors']}")
+
+    # 2. Run the approved diagnostic tool.
+    if "inspect_incident" not in policy["allowed_tools"]:
+        raise ValueError("Diagnostic tool is not allowed by policy.")
+
+    evidence = inspect_incident(service, problem)
+
+    # 3. Limit the historical context.
+    previous_incidents = previous_incidents or []
+    memory_limit = policy["context_policy"]["max_memory_items"]
+    memory_items = previous_incidents[:memory_limit]
+
+    if memory_items:
+        memory_text = "\n".join(
+            (
+                f"- Service: {item.get('service', 'unknown')}; "
+                f"Problem: {item.get('problem', 'unknown')}; "
+                f"Root cause: {item.get('root_cause', 'not recorded')}; "
+                f"Resolution: {item.get('resolution', 'not recorded')}; "
+                f"Verification: "
+                f"{item.get('verification_notes', 'not recorded')}"
+            )
+            for item in memory_items
+        )
+    else:
+        memory_text = "No matching resolved incidents were provided."
+
+    # 4. Ask Ollama to analyze the evidence.
+    prompt = f"""
+You are NEXUS, an AI Production Support Engineer.
+
+CURRENT INCIDENT
+Service: {service}
+Problem: {problem}
+
+TASK POLICY
+Task type: {policy['task_type']}
+Investigation focus: {', '.join(policy['investigation_focus'])}
+
+DIAGNOSTIC EVIDENCE
+{evidence}
+
+HISTORICAL MEMORY
+{memory_text}
+
+RULES
+1. Distinguish observed facts from hypotheses.
+2. Historical incidents are clues, not proof.
+3. If evidence is insufficient, say so.
+4. Do not claim real infrastructure was queried when evidence is simulated.
+5. Do not claim a fix is verified without verification evidence.
+6. Recommend safe next steps.
+7. Use simple English.
+
+Return these sections:
+Likely root cause:
+Evidence:
+Recommended next steps:
+How to verify the fix:
+"""
+
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    ai_analysis = response.json()["response"]
+
+    # 5. Preserve existing result fields and add harness metadata.
+    return {
+        "ai_analysis": ai_analysis,
+        "diagnosis": evidence,
+        "memory_used": memory_items,
+        "harness": {
+            "policy_version": policy["version"],
+            "task_type": policy["task_type"],
+            "investigation_focus": policy["investigation_focus"],
+            "policy_validation": validation,
+            "tool_calls_allowed": policy["max_tool_calls"],
+            "tool_calls_used": 1,
+            "memory_items_used": len(memory_items),
+        },
+    }

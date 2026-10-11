@@ -1,0 +1,963 @@
+
+import { useCallback, useEffect, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
+import "./App.css";
+
+const API = "http://127.0.0.1:8001";
+
+type Diagnosis = Record<string, unknown> | string | null;
+
+type Incident = {
+  _id: string;
+  service: string;
+  problem: string;
+  diagnosis: Diagnosis;
+  ai_analysis?: string;
+  root_cause?: string;
+  fix_applied?: string;
+  verification_notes?: string;
+  status: "open" | "closed";
+  created_at?: string;
+  updated_at?: string;
+  memory_used?: unknown[];
+  harness?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+type InvestigationResult = {
+  incident?: unknown;
+  diagnosis?: Diagnosis;
+  ai_analysis?: unknown;
+  analysis?: unknown;
+  recommendations?: unknown;
+  memory_used?: unknown[];
+  harness?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+function readableDiagnosis(diagnosis: unknown): string {
+  if (typeof diagnosis === "string") return diagnosis;
+
+  if (diagnosis && typeof diagnosis === "object") {
+    const details = diagnosis as Record<string, unknown>;
+
+    for (const key of [
+      "finding",
+      "summary",
+      "root_cause",
+      "evidence",
+      "recommendation",
+    ]) {
+      const value = details[key];
+      if (typeof value === "string" && value.trim()) return value;
+    }
+
+    return JSON.stringify(diagnosis, null, 2);
+  }
+
+  if (diagnosis == null) return "No diagnosis available yet.";
+  return String(diagnosis);
+}
+
+function normalizeIncident(value: unknown): Incident | null {
+  if (!value || typeof value !== "object") return null;
+
+  const item = value as Record<string, unknown>;
+  const id =
+    typeof item._id === "string"
+      ? item._id
+      : typeof item.incident_id === "string"
+        ? item.incident_id
+        : null;
+
+  if (
+    !id ||
+    typeof item.service !== "string" ||
+    typeof item.problem !== "string"
+  ) {
+    return null;
+  }
+
+  const status = String(item.status ?? "open").toLowerCase();
+
+  return {
+    ...item,
+    _id: id,
+    service: item.service,
+    problem: item.problem,
+    diagnosis: (item.diagnosis as Diagnosis) ?? null,
+    status: status === "closed" || status === "resolved" ? "closed" : "open",
+  };
+}
+
+function getErrorMessage(data: unknown, fallback: string): string {
+  if (data && typeof data === "object" && "detail" in data) {
+    const detail = (data as { detail?: unknown }).detail;
+    if (typeof detail === "string") return detail;
+    if (detail != null) return JSON.stringify(detail);
+  }
+
+  return fallback;
+}
+
+async function requestJson(
+  url: string,
+  options?: RequestInit,
+): Promise<unknown> {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options?.headers,
+    },
+  });
+
+  const data: unknown = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(
+      getErrorMessage(data, `Request failed with status ${response.status}.`),
+    );
+  }
+
+  return data;
+}
+
+function formatDate(value?: string): string {
+  if (!value) return "—";
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+/**
+ * Convert escaped Markdown into ordinary Markdown.
+ * Example: \*\*Root Cause:\*\* becomes **Root Cause:**
+ */
+function cleanMarkdown(value: string): string {
+  return value
+    .replace(/\\([\\`*_{}[\]()#+.!>|~-])/g, "$1")
+    .replace(/\r\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .trim();
+}
+
+function extractRecommendations(analysis: unknown): string {
+  if (typeof analysis !== "string" || !analysis.trim()) {
+    return "Recommendations were not returned by the backend.";
+  }
+
+  const text = cleanMarkdown(analysis);
+  const headingPattern =
+    /(?:^|\n)\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?(?:Recommended Next Steps|Recommendations|Recommended Actions)(?:\*\*)?\s*:?\s*/i;
+
+  const match = headingPattern.exec(text);
+
+  if (!match || match.index === undefined) {
+    return "No separate recommendations section was found in the AI analysis.";
+  }
+
+  const start = match.index + match[0].length;
+  const remaining = text.slice(start);
+
+  const nextHeading = remaining.search(
+    /\n\s{0,3}(?:#{1,6}\s+|\*\*)[^\n]*(?:\*\*)?\s*:?\s*(?:\n|$)/,
+  );
+
+  const recommendations =
+    nextHeading >= 0
+      ? remaining.slice(0, nextHeading).trim()
+      : remaining.trim();
+
+  return recommendations || "The AI returned an empty recommendations section.";
+}
+
+/**
+ * Remove the recommendations section from the main analysis so that
+ * the same content does not appear in both cards.
+ */
+function removeRecommendationsSection(analysis: string): string {
+  const text = cleanMarkdown(analysis);
+
+  const headingPattern =
+    /(?:^|\n)\s{0,3}(?:#{1,6}\s*)?(?:\*\*)?(?:Recommended Next Steps|Recommendations|Recommended Actions)(?:\*\*)?\s*:?\s*/i;
+
+  const match = headingPattern.exec(text);
+
+  if (!match || match.index === undefined) return text;
+
+  const start = match.index;
+  const remaining = text.slice(start + match[0].length);
+
+  const nextHeading = remaining.search(
+    /\n\s{0,3}(?:#{1,6}\s+|\*\*)[^\n]*(?:\*\*)?\s*:?\s*(?:\n|$)/,
+  );
+
+  if (nextHeading >= 0) {
+    return (
+      text.slice(0, start).trim() +
+      "\n\n" +
+      remaining.slice(nextHeading).trim()
+    ).trim();
+  }
+
+  return text.slice(0, start).trim();
+}
+
+/**
+ * A lightweight Markdown renderer.
+ * Supports headings, bold text, inline code, bullets, numbered lists,
+ * paragraphs and blockquotes. It does not execute HTML.
+ */
+function renderInline(text: string): ReactNode[] {
+  const pattern =
+    /(\*\*.+?\*\*|__.+?__|`[^`]+`|\*[^*\n]+\*|_[^_\n]+_)/g;
+
+  const output: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      output.push(text.slice(lastIndex, match.index));
+    }
+
+    const token = match[0];
+
+    if (token.startsWith("**") || token.startsWith("__")) {
+      output.push(
+        <strong key={key++}>{token.slice(2, -2)}</strong>,
+      );
+    } else if (token.startsWith("`")) {
+      output.push(<code key={key++}>{token.slice(1, -1)}</code>);
+    } else {
+      output.push(<em key={key++}>{token.slice(1, -1)}</em>);
+    }
+
+    lastIndex = pattern.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    output.push(text.slice(lastIndex));
+  }
+
+  return output;
+}
+
+function MarkdownContent({ content }: { content: unknown }) {
+  if (content == null || content === "") {
+    return <p className="muted">No content available.</p>;
+  }
+
+  const text =
+    typeof content === "string"
+      ? cleanMarkdown(content)
+      : JSON.stringify(content, null, 2);
+
+  const lines = text.split("\n");
+  const blocks: ReactNode[] = [];
+  let paragraph: string[] = [];
+  let listItems: { text: string; ordered: boolean }[] = [];
+  let key = 0;
+
+  const flushParagraph = () => {
+    if (paragraph.length > 0) {
+      const value = paragraph.join(" ").trim();
+      if (value) {
+        blocks.push(<p key={key++}>{renderInline(value)}</p>);
+      }
+      paragraph = [];
+    }
+  };
+
+  const flushList = () => {
+    if (listItems.length === 0) return;
+
+    const ordered = listItems[0].ordered;
+    const items = listItems;
+    listItems = [];
+
+    const children = items.map((item, index) => (
+      <li key={index}>{renderInline(item.text)}</li>
+    ));
+
+    blocks.push(
+      ordered ? (
+        <ol key={key++}>{children}</ol>
+      ) : (
+        <ul key={key++}>{children}</ul>
+      ),
+    );
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+
+    if (heading) {
+      flushParagraph();
+      flushList();
+
+      const level = heading[1].length;
+      const title = heading[2].replace(/\*\*/g, "");
+      const contentNode = renderInline(title);
+
+      if (level <= 2) {
+        blocks.push(
+          <h3 key={key++}>{contentNode}</h3>,
+        );
+      } else {
+        blocks.push(
+          <h4 key={key++}>{contentNode}</h4>,
+        );
+      }
+      continue;
+    }
+
+    const unordered = /^[-*+]\s+(.+)$/.exec(line);
+    const ordered = /^\d+[.)]\s+(.+)$/.exec(line);
+
+    if (unordered || ordered) {
+      flushParagraph();
+
+      const isOrdered = Boolean(ordered);
+
+      if (listItems.length > 0 && listItems[0].ordered !== isOrdered) {
+        flushList();
+      }
+
+      listItems.push({
+        text: (unordered ?? ordered)![1],
+        ordered: isOrdered,
+      });
+      continue;
+    }
+
+    if (line.startsWith(">")) {
+      flushParagraph();
+      flushList();
+      blocks.push(
+        <blockquote key={key++}>
+          {renderInline(line.replace(/^>\s?/, ""))}
+        </blockquote>,
+      );
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+
+  return <div className="markdown-content">{blocks}</div>;
+}
+
+function App() {
+  const [service, setService] = useState("payment-service");
+  const [problem, setProblem] = useState("");
+  const [history, setHistory] = useState<Incident[]>([]);
+  const [selected, setSelected] = useState<Incident | null>(null);
+  const [result, setResult] = useState<InvestigationResult | null>(null);
+
+  const [rootCause, setRootCause] = useState("");
+  const [fixApplied, setFixApplied] = useState("");
+  const [verificationNotes, setVerificationNotes] = useState("");
+
+  const [loadingHistory, setLoadingHistory] = useState(true);
+  const [investigating, setInvestigating] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const loadHistory = useCallback(async () => {
+    setLoadingHistory(true);
+
+    try {
+      const data = await requestJson(`${API}/incidents`);
+
+      const rawIncidents = Array.isArray(data)
+        ? data
+        : data &&
+            typeof data === "object" &&
+            "incidents" in data &&
+            Array.isArray((data as { incidents: unknown }).incidents)
+          ? (data as { incidents: unknown[] }).incidents
+          : [];
+
+      const normalized = rawIncidents
+        .map(normalizeIncident)
+        .filter((item): item is Incident => item !== null);
+
+      setHistory(normalized);
+      setError("");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to load incident history.",
+      );
+    } finally {
+      setLoadingHistory(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadHistory();
+  }, [loadHistory]);
+
+  const openCount = history.filter(
+    (incident) => incident.status === "open",
+  ).length;
+
+  const closedCount = history.filter(
+    (incident) => incident.status === "closed",
+  ).length;
+
+  async function handleInvestigate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!problem.trim()) {
+      setError("Please describe the production problem.");
+      return;
+    }
+
+    setInvestigating(true);
+    setError("");
+    setNotice("");
+    setResult(null);
+    setSelected(null);
+
+    try {
+      const data = await requestJson(`${API}/investigate`, {
+        method: "POST",
+        body: JSON.stringify({
+          service,
+          problem: problem.trim(),
+        }),
+      });
+
+      if (!data || typeof data !== "object") {
+        throw new Error(
+          "The investigation API returned an unexpected response.",
+        );
+      }
+
+      const response = data as InvestigationResult;
+      setResult(response);
+
+      const incident = normalizeIncident(response.incident ?? data);
+
+      if (incident) {
+        setSelected(incident);
+        setRootCause(
+          incident.root_cause ?? readableDiagnosis(incident.diagnosis),
+        );
+        setFixApplied(incident.fix_applied ?? "");
+        setVerificationNotes(incident.verification_notes ?? "");
+      } else if (response.diagnosis !== undefined) {
+        setRootCause(readableDiagnosis(response.diagnosis));
+      }
+
+      await loadHistory();
+      setNotice("Investigation completed and incident saved.");
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Investigation failed.",
+      );
+    } finally {
+      setInvestigating(false);
+    }
+  }
+
+  function handleSelectIncident(incident: Incident) {
+    setSelected(incident);
+    setResult({
+      incident,
+      diagnosis: incident.diagnosis,
+      ai_analysis: incident.ai_analysis,
+      memory_used: incident.memory_used,
+      harness: incident.harness,
+    });
+    setRootCause(incident.root_cause ?? "");
+    setFixApplied(incident.fix_applied ?? "");
+    setVerificationNotes(incident.verification_notes ?? "");
+    setError("");
+    setNotice("");
+  }
+
+  async function handleResolve(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!selected) {
+      setError("Select an incident first.");
+      return;
+    }
+
+    if (!rootCause.trim() || !fixApplied.trim()) {
+      setError("Enter the root cause and the fix applied.");
+      return;
+    }
+
+    setResolving(true);
+    setError("");
+    setNotice("");
+
+    try {
+      const data = await requestJson(
+        `${API}/incidents/${encodeURIComponent(selected._id)}/resolve`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            root_cause: rootCause.trim(),
+            fix_applied: fixApplied.trim(),
+            verification_notes: verificationNotes.trim(),
+          }),
+        },
+      );
+
+      const updated = normalizeIncident(
+        data &&
+          typeof data === "object" &&
+          "incident" in data
+          ? (data as { incident: unknown }).incident
+          : data,
+      );
+
+      if (updated) {
+        setSelected(updated);
+      } else {
+        setSelected({
+          ...selected,
+          root_cause: rootCause.trim(),
+          fix_applied: fixApplied.trim(),
+          verification_notes: verificationNotes.trim(),
+          status: "closed",
+        });
+      }
+
+      await loadHistory();
+      setNotice("Resolution saved.");
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Unable to resolve the incident.",
+      );
+    } finally {
+      setResolving(false);
+    }
+  }
+
+  async function handleDelete(incident: Incident) {
+    const confirmed = window.confirm(
+      `Delete incident "${incident.problem}"? This cannot be undone.`,
+    );
+
+    if (!confirmed) return;
+
+    setDeletingId(incident._id);
+    setError("");
+    setNotice("");
+
+    try {
+      await requestJson(
+        `${API}/incidents/${encodeURIComponent(incident._id)}`,
+        { method: "DELETE" },
+      );
+
+      if (selected?._id === incident._id) {
+        setSelected(null);
+        setResult(null);
+        setRootCause("");
+        setFixApplied("");
+        setVerificationNotes("");
+      }
+
+      await loadHistory();
+      setNotice("Incident deleted.");
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Unable to delete the incident.",
+      );
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  const displayedDiagnosis =
+    result?.diagnosis ??
+    selected?.diagnosis ??
+    "Run an investigation or select an incident to view its diagnosis.";
+
+  const rawAnalysis =
+    result?.analysis ?? result?.ai_analysis ?? selected?.ai_analysis;
+
+  const displayedAnalysis =
+    typeof rawAnalysis === "string"
+      ? removeRecommendationsSection(rawAnalysis)
+      : rawAnalysis;
+
+  const displayedRecommendations =
+    result?.recommendations !== undefined
+      ? result.recommendations
+      : extractRecommendations(rawAnalysis);
+
+  return (
+    <main className="app">
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-mark">N</div>
+          <div>
+            <h1>NEXUS</h1>
+            <p>AI Production Support Engineer</p>
+          </div>
+        </div>
+
+        <div className="system-status">
+          <span className="status-dot" />
+          Production Support
+        </div>
+      </header>
+
+      <section className="hero">
+        <p className="eyebrow">INTELLIGENT INCIDENT MANAGEMENT</p>
+        <h2>Investigate. Understand. Resolve.</h2>
+        <p>
+          Investigate production incidents, review AI-generated findings,
+          and keep a history of troubleshooting and resolutions.
+        </p>
+      </section>
+
+      {error && (
+        <div className="alert alert-error" role="alert">
+          <strong>Error:</strong> {error}
+          <button type="button" onClick={() => setError("")}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {notice && (
+        <div className="alert alert-success" role="status">
+          {notice}
+          <button type="button" onClick={() => setNotice("")}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      <section className="stats-grid" aria-label="Incident statistics">
+        <article className="stat-card">
+          <span>Total incidents</span>
+          <strong>{history.length}</strong>
+        </article>
+        <article className="stat-card">
+          <span>Open incidents</span>
+          <strong>{openCount}</strong>
+        </article>
+        <article className="stat-card">
+          <span>Resolved incidents</span>
+          <strong>{closedCount}</strong>
+        </article>
+        <article className="stat-card">
+          <span>History status</span>
+          <strong className="stat-small">
+            {loadingHistory ? "Loading…" : "Up to date"}
+          </strong>
+        </article>
+      </section>
+
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">STEP 1</p>
+            <h2>Investigate an incident</h2>
+          </div>
+          <span className="tag">AI-assisted</span>
+        </div>
+
+        <form onSubmit={handleInvestigate} className="form-grid">
+          <label className="field">
+            <span>Service</span>
+            <select
+              value={service}
+              onChange={(event) => setService(event.target.value)}
+              disabled={investigating}
+            >
+              <option value="payment-service">Payment Service</option>
+              <option value="kafka-consumer">Kafka Consumer</option>
+              <option value="api-service">API Service</option>
+            </select>
+          </label>
+
+          <label className="field field-full">
+            <span>Production problem</span>
+            <textarea
+              value={problem}
+              onChange={(event) => setProblem(event.target.value)}
+              placeholder="Example: Payment API latency is high and database requests are timing out."
+              rows={4}
+              required
+              disabled={investigating}
+            />
+          </label>
+
+          <div className="form-actions field-full">
+            <button
+              type="submit"
+              className="button button-primary"
+              disabled={investigating}
+            >
+              {investigating ? "Investigating…" : "Investigate incident"}
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">STEP 2</p>
+            <h2>Investigation results</h2>
+          </div>
+        </div>
+
+        <div className="result-grid">
+          <article className="result-card">
+            <h3>Diagnosis</h3>
+            <MarkdownContent content={readableDiagnosis(displayedDiagnosis)} />
+          </article>
+
+          <article className="result-card">
+            <h3>AI analysis</h3>
+            {displayedAnalysis !== undefined && displayedAnalysis !== null ? (
+              <MarkdownContent content={displayedAnalysis} />
+            ) : (
+              <p className="muted">
+                Analysis will appear here after an investigation.
+              </p>
+            )}
+            <p className="muted">
+              AI-generated findings are hypotheses until confirmed by
+              production evidence.
+            </p>
+          </article>
+
+          <article className="result-card">
+            <h3>Recommendations</h3>
+            <MarkdownContent content={displayedRecommendations} />
+          </article>
+
+          <article className="result-card">
+            <h3>Incident memory and harness</h3>
+            <p>
+              Previous incidents referenced:{" "}
+              <strong>{result?.memory_used?.length ?? 0}</strong>
+            </p>
+            <pre className="diagnosis-text">
+              {result?.harness
+                ? JSON.stringify(result.harness, null, 2)
+                : "Harness details will appear here when returned by the backend."}
+            </pre>
+          </article>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">STEP 3</p>
+            <h2>Record the resolution</h2>
+          </div>
+        </div>
+
+        {!selected && (
+          <p className="muted">
+            Select an incident from the history below to record its resolution.
+          </p>
+        )}
+
+        {selected && (
+          <>
+            <div className="selected-incident">
+              <div>
+                <span className="muted">Selected incident</span>
+                <h3>{selected.problem}</h3>
+                <p>{selected.service}</p>
+              </div>
+              <span
+                className={`status-pill ${
+                  selected.status === "closed" ? "status-closed" : "status-open"
+                }`}
+              >
+                {selected.status === "closed" ? "Resolved" : "Open"}
+              </span>
+            </div>
+
+            <form onSubmit={handleResolve} className="form-grid">
+              <label className="field field-full">
+                <span>Root cause</span>
+                <textarea
+                  value={rootCause}
+                  onChange={(event) => setRootCause(event.target.value)}
+                  rows={3}
+                  placeholder="Describe the confirmed root cause."
+                  required
+                />
+              </label>
+
+              <label className="field field-full">
+                <span>Fix applied</span>
+                <textarea
+                  value={fixApplied}
+                  onChange={(event) => setFixApplied(event.target.value)}
+                  rows={3}
+                  placeholder="Describe the fix that was applied."
+                  required
+                />
+              </label>
+
+              <label className="field field-full">
+                <span>Verification notes</span>
+                <textarea
+                  value={verificationNotes}
+                  onChange={(event) => setVerificationNotes(event.target.value)}
+                  rows={2}
+                  placeholder="Describe how you verified the fix."
+                />
+              </label>
+
+              <div className="form-actions field-full">
+                <button
+                  type="submit"
+                  className="button button-primary"
+                  disabled={resolving}
+                >
+                  {resolving ? "Saving…" : "Save resolution"}
+                </button>
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={() => {
+                    setSelected(null);
+                    setResult(null);
+                    setRootCause("");
+                    setFixApplied("");
+                    setVerificationNotes("");
+                  }}
+                >
+                  Cancel selection
+                </button>
+              </div>
+            </form>
+          </>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">INCIDENT RECORDS</p>
+            <h2>Incident history</h2>
+            <p className="muted">
+              Review an incident, open it in the resolution form, or delete it.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            className="button button-secondary"
+            onClick={() => void loadHistory()}
+            disabled={loadingHistory}
+          >
+            {loadingHistory ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
+
+        {loadingHistory && history.length === 0 ? (
+          <p className="muted">Loading incident history…</p>
+        ) : history.length === 0 ? (
+          <div className="empty-state">
+            <h3>No incidents found</h3>
+            <p>
+              The history API returned no usable incident records. Try Refresh
+              or check the backend response if incidents are expected here.
+            </p>
+          </div>
+        ) : (
+          <div className="table-wrap">
+            <table className="incident-table">
+              <thead>
+                <tr>
+                  <th>Service</th>
+                  <th>Problem</th>
+                  <th>Status</th>
+                  <th>Created</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((incident) => (
+                  <tr key={incident._id}>
+                    <td>{incident.service}</td>
+                    <td className="problem-cell">{incident.problem}</td>
+                    <td>
+                      <span
+                        className={`status-pill ${
+                          incident.status === "closed"
+                            ? "status-closed"
+                            : "status-open"
+                        }`}
+                      >
+                        {incident.status === "closed" ? "Resolved" : "Open"}
+                      </span>
+                    </td>
+                    <td>{formatDate(incident.created_at)}</td>
+                    <td>
+                      <div className="table-actions">
+                        <button
+                          type="button"
+                          className="button button-small button-secondary"
+                          onClick={() => handleSelectIncident(incident)}
+                        >
+                          View
+                        </button>
+                        <button
+                          type="button"
+                          className="button button-small button-danger"
+                          onClick={() => void handleDelete(incident)}
+                          disabled={deletingId === incident._id}
+                        >
+                          {deletingId === incident._id ? "Deleting…" : "Delete"}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <footer className="footer">
+        <p>NEXUS AI Production Support Engineer</p>
+        <p>
+          AI-generated findings are hypotheses until verified against
+          production evidence.
+        </p>
+      </footer>
+    </main>
+  );
+}
+
+export default App;

@@ -1,0 +1,231 @@
+
+import logging
+import os
+
+import requests
+from dotenv import load_dotenv
+from pymongo import MongoClient
+
+from adaptive_policy import (
+    BASE_POLICY,
+    build_task_policy,
+    validate_policy,
+)
+from diagnostic_tools import inspect_incident
+
+
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+
+load_dotenv()
+
+logger = logging.getLogger("nexus.agent")
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:latest"
+
+MONGODB_URI = os.getenv("MONGODB_URI")
+
+if not MONGODB_URI:
+    raise RuntimeError(
+        "MONGODB_URI is missing. Check your .env file."
+    )
+
+# Use the same database and active-policy collection
+# as main.py. A separate client avoids a circular import.
+mongo_client = MongoClient(
+    MONGODB_URI,
+    serverSelectionTimeoutMS=10000,
+)
+
+database = mongo_client["production_support"]
+active_policies = database["active_policies"]
+
+
+# ---------------------------------------------------------
+# LOAD ACTIVE POLICY
+# ---------------------------------------------------------
+
+def load_active_policy() -> dict:
+    """
+    Load and validate the active policy from MongoDB.
+
+    Fail closed if the active policy is missing or invalid.
+    """
+    document = active_policies.find_one({"_id": "active"})
+
+    if not document:
+        raise RuntimeError(
+            "No active policy found in MongoDB. "
+            "Initialize the policy using main.py first."
+        )
+
+    policy = document.get("policy")
+
+    if not isinstance(policy, dict):
+        raise RuntimeError(
+            "The active policy document is missing its policy."
+        )
+
+    validation = validate_policy(policy)
+
+    if not validation["valid"]:
+        raise ValueError(
+            f"Active policy rejected: {validation['errors']}"
+        )
+
+    if document.get("version") != policy.get("version"):
+        raise ValueError(
+            "Active policy version does not match its registry version."
+        )
+
+    return policy
+
+
+# ---------------------------------------------------------
+# INVESTIGATE AN INCIDENT
+# ---------------------------------------------------------
+
+def investigate_with_agent(
+    service: str,
+    problem: str,
+    previous_incidents: list[dict] | None = None,
+) -> dict:
+    """
+    Investigate an incident using the active MongoDB policy.
+    """
+
+    # 1. Load the active policy.
+    active_policy = load_active_policy()
+
+    # 2. Build and validate the task-specific policy.
+    policy = build_task_policy(
+        service,
+        base_policy=active_policy,
+    )
+
+    validation = validate_policy(policy)
+
+    if not validation["valid"]:
+        raise ValueError(
+            f"Agent policy rejected: {validation['errors']}"
+        )
+
+    # 3. Enforce the approved tool allowlist and call limit.
+    allowed_tools = policy.get("allowed_tools", [])
+
+    if "inspect_incident" not in allowed_tools:
+        raise ValueError(
+            "Diagnostic tool is not allowed by the active policy."
+        )
+
+    max_tool_calls = policy.get("max_tool_calls", 0)
+
+    if max_tool_calls < 1:
+        raise ValueError(
+            "Active policy does not permit a diagnostic tool call."
+        )
+
+    # The current prototype uses one diagnostic tool call.
+    evidence = inspect_incident(service, problem)
+    tool_calls_used = 1
+
+    if tool_calls_used > max_tool_calls:
+        raise RuntimeError(
+            "Diagnostic tool call limit was exceeded."
+        )
+
+    # 4. Apply the active policy's historical-memory limit.
+    previous_incidents = previous_incidents or []
+    context_policy = policy["context_policy"]
+
+    if context_policy.get(
+        "include_similar_resolved_incidents"
+    ) is True:
+        memory_limit = context_policy["max_memory_items"]
+        memory_items = previous_incidents[:memory_limit]
+    else:
+        memory_items = []
+
+    if memory_items:
+        memory_text = "\n".join(
+            (
+                f"- Service: {item.get('service', 'unknown')}; "
+                f"Problem: {item.get('problem', 'unknown')}; "
+                f"Root cause: {item.get('root_cause', 'not recorded')}; "
+                f"Resolution: {item.get('resolution', 'not recorded')}; "
+                f"Verification: "
+                f"{item.get('verification_notes', 'not recorded')}"
+            )
+            for item in memory_items
+        )
+    else:
+        memory_text = "No matching resolved incidents were provided."
+
+    # 5. Ask Ollama to analyze the evidence.
+    prompt = f"""
+You are NEXUS, an AI Production Support Engineer.
+
+CURRENT INCIDENT
+Service: {service}
+Problem: {problem}
+
+TASK POLICY
+Policy version: {policy['version']}
+Task type: {policy['task_type']}
+Investigation focus: {', '.join(policy['investigation_focus'])}
+
+DIAGNOSTIC EVIDENCE
+{evidence}
+
+HISTORICAL MEMORY
+{memory_text}
+
+SAFETY RULES
+1. Distinguish observed facts from hypotheses.
+2. Historical incidents are clues, not proof.
+3. If evidence is insufficient, say so clearly.
+4. Do not claim real infrastructure was queried if evidence is simulated.
+5. Do not claim a fix is verified without verification evidence.
+6. Recommend safe next steps.
+7. Do not execute production changes or mutations.
+8. Use simple English.
+
+Return these sections:
+Likely root cause:
+Evidence:
+Recommended next steps:
+How to verify the fix:
+"""
+
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        },
+        timeout=120,
+    )
+
+    response.raise_for_status()
+    ai_analysis = response.json()["response"]
+
+    # 6. Return explicit evidence and preserve existing fields.
+    return {
+        "ai_analysis": ai_analysis,
+        "diagnosis": evidence,
+        "evidence": evidence,
+        "memory_used": memory_items,
+        "harness": {
+            "policy_version": policy["version"],
+            "task_type": policy["task_type"],
+            "investigation_focus": policy["investigation_focus"],
+            "policy_validation": validation,
+            "tool_calls_allowed": max_tool_calls,
+            "tool_calls_used": tool_calls_used,
+            "memory_items_used": len(memory_items),
+            "active_policy_source": "mongodb",
+        },
+    }

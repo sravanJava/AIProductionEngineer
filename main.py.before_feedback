@@ -1,0 +1,797 @@
+
+import logging
+import os
+from copy import deepcopy
+from datetime import datetime, timezone
+
+from bson import ObjectId
+from bson.errors import InvalidId
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from pymongo import MongoClient, DESCENDING
+
+from agent import investigate_with_agent
+from adaptive_policy import BASE_POLICY, validate_policy
+from improvement_engine import propose_improvement
+
+
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("nexus")
+
+MONGODB_URI = os.getenv("MONGODB_URI")
+
+if not MONGODB_URI:
+    raise RuntimeError(
+        "MONGODB_URI is missing. Check your .env file."
+    )
+
+mongo_client = MongoClient(
+    MONGODB_URI,
+    serverSelectionTimeoutMS=10000,
+)
+
+database = mongo_client["production_support"]
+
+incidents = database["incidents"]
+harness_evaluations = database["harness_evaluations"]
+harness_proposals = database["harness_proposals"]
+active_policies = database["active_policies"]
+
+
+# ---------------------------------------------------------
+# FASTAPI APPLICATION
+# ---------------------------------------------------------
+
+app = FastAPI(
+    title="NEXUS AI Production Support Engineer",
+    version="1.0.0",
+    description=(
+        "AI-assisted incident investigation with "
+        "policy validation and human-approved improvements."
+    ),
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------
+# REQUEST MODELS
+# ---------------------------------------------------------
+
+class InvestigateRequest(BaseModel):
+    service: str = Field(min_length=1, max_length=100)
+    problem: str = Field(min_length=1, max_length=5000)
+
+
+class ResolveIncidentRequest(BaseModel):
+    root_cause: str = Field(min_length=1, max_length=5000)
+    resolution: str = Field(min_length=1, max_length=5000)
+    verification_notes: str = Field(
+        default="",
+        max_length=5000,
+    )
+
+
+class HarnessEvaluationRequest(BaseModel):
+    sample_size: int = Field(ge=0, le=100000)
+    memory_helpfulness_rate: float = Field(ge=0, le=1)
+
+
+# ---------------------------------------------------------
+# GENERAL HELPERS
+# ---------------------------------------------------------
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def serialize_document(document: dict) -> dict:
+    """Convert MongoDB ObjectId and datetime values to JSON-safe values."""
+    result = {}
+
+    for key, value in document.items():
+        if key == "_id":
+            result["id"] = str(value)
+        elif isinstance(value, ObjectId):
+            result[key] = str(value)
+        elif isinstance(value, datetime):
+            result[key] = value.isoformat()
+        else:
+            result[key] = value
+
+    return result
+
+
+def serialize_incident(document: dict) -> dict:
+    result = serialize_document(document)
+
+    if "id" in result:
+        result["incident_id"] = result.pop("id")
+
+    return result
+
+
+def get_object_id(identifier: str) -> ObjectId:
+    try:
+        return ObjectId(identifier)
+    except (InvalidId, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ID format.",
+        )
+
+
+def find_similar_resolved_incidents(
+    service: str,
+    problem: str,
+    limit: int = 3,
+) -> list[dict]:
+    """
+    Find resolved incidents from the same service.
+
+    This uses simple keyword overlap, not semantic vector search.
+    Historical matches are clues, not proof of a root cause.
+    """
+    documents = list(
+        incidents.find(
+            {
+                "service": service,
+                "status": "resolved",
+            }
+        ).sort("resolved_at", DESCENDING).limit(100)
+    )
+
+    problem_words = {
+        word.lower().strip(".,!?():;")
+        for word in problem.split()
+        if len(word) > 2
+    }
+
+    ranked = []
+
+    for document in documents:
+        historical_text = (
+            str(document.get("problem", ""))
+            + " "
+            + str(document.get("root_cause", ""))
+            + " "
+            + str(document.get("resolution", ""))
+        )
+
+        historical_words = {
+            word.lower().strip(".,!?():;")
+            for word in historical_text.split()
+            if len(word) > 2
+        }
+
+        overlap = len(problem_words & historical_words)
+
+        if overlap > 0:
+            ranked.append((overlap, document))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    return [
+        serialize_incident(document)
+        for _, document in ranked[:limit]
+    ]
+
+
+# ---------------------------------------------------------
+# ACTIVE POLICY REGISTRY
+# ---------------------------------------------------------
+
+def get_or_create_active_policy() -> dict:
+    """
+    Read the active policy from MongoDB.
+
+    If no active policy exists, initialize it from BASE_POLICY.
+    """
+    document = active_policies.find_one({"_id": "active"})
+
+    if document:
+        return document
+
+    initial_policy = deepcopy(BASE_POLICY)
+    validation = validate_policy(initial_policy)
+
+    if not validation["valid"]:
+        raise HTTPException(
+            status_code=500,
+            detail="Default policy failed safety validation.",
+        )
+
+    active_policies.update_one(
+        {"_id": "active"},
+        {
+            "$setOnInsert": {
+                "policy": initial_policy,
+                "version": initial_policy["version"],
+                "updated_at": utc_now(),
+                "activated_from_proposal": None,
+            }
+        },
+        upsert=True,
+    )
+
+    document = active_policies.find_one({"_id": "active"})
+
+    if not document:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not initialize the active policy.",
+        )
+
+    return document
+
+
+# ---------------------------------------------------------
+# BASIC HEALTH ENDPOINTS
+# ---------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {
+        "application": "NEXUS AI Production Support Engineer",
+        "status": "running",
+        "version": "1.0.0",
+    }
+
+
+@app.get("/health")
+def health():
+    try:
+        mongo_client.admin.command("ping")
+
+        return {
+            "status": "healthy",
+            "mongodb": "connected",
+            "timestamp": utc_now().isoformat(),
+        }
+
+    except Exception:
+        logger.exception("Health check failed")
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "mongodb": "connection failed",
+            },
+        )
+
+
+# ---------------------------------------------------------
+# INCIDENT INVESTIGATION
+# ---------------------------------------------------------
+
+@app.post("/investigate")
+def investigate_incident_endpoint(
+    request: InvestigateRequest,
+):
+    service = request.service.strip()
+    problem = request.problem.strip()
+
+    if not service or not problem:
+        raise HTTPException(
+            status_code=422,
+            detail="Service and problem are required.",
+        )
+
+    try:
+        previous_incidents = find_similar_resolved_incidents(
+            service=service,
+            problem=problem,
+            limit=3,
+        )
+
+        # The current agent builds its own policy from
+        # adaptive_policy.py. Active-policy integration into
+        # the agent is a separate step.
+        result = investigate_with_agent(
+            service=service,
+            problem=problem,
+            previous_incidents=previous_incidents,
+        )
+
+        incident_document = {
+            "service": service,
+            "problem": problem,
+            "ai_analysis": result.get("ai_analysis", ""),
+            "diagnosis": result.get("diagnosis", {}),
+            "memory_used": result.get("memory_used", []),
+            "harness": result.get("harness", {}),
+            "status": "open",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+        }
+
+        insert_result = incidents.insert_one(incident_document)
+        incident_document["_id"] = insert_result.inserted_id
+
+        return {
+            "incident": serialize_incident(incident_document),
+            "ai_analysis": result.get("ai_analysis", ""),
+            "diagnosis": result.get("diagnosis", {}),
+            "memory_used": result.get("memory_used", []),
+            "harness": result.get("harness", {}),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("Incident investigation failed")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Incident investigation failed. Check backend logs.",
+        )
+
+
+# ---------------------------------------------------------
+# LIST INCIDENTS
+# ---------------------------------------------------------
+
+@app.get("/incidents")
+def list_incidents(
+    limit: int = 50,
+    status: str | None = None,
+):
+    limit = max(1, min(limit, 200))
+
+    query = {}
+
+    if status:
+        allowed_statuses = {"open", "resolved"}
+
+        if status not in allowed_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail="Status must be 'open' or 'resolved'.",
+            )
+
+        query["status"] = status
+
+    documents = list(
+        incidents.find(query)
+        .sort("created_at", DESCENDING)
+        .limit(limit)
+    )
+
+    return {
+        "count": len(documents),
+        "incidents": [
+            serialize_incident(document)
+            for document in documents
+        ],
+    }
+
+
+# ---------------------------------------------------------
+# GET ONE INCIDENT
+# ---------------------------------------------------------
+
+@app.get("/incidents/{incident_id}")
+def get_incident(incident_id: str):
+    object_id = get_object_id(incident_id)
+
+    document = incidents.find_one({"_id": object_id})
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Incident not found.",
+        )
+
+    return serialize_incident(document)
+
+
+# ---------------------------------------------------------
+# RESOLVE INCIDENT
+# ---------------------------------------------------------
+
+@app.patch("/incidents/{incident_id}/resolve")
+def resolve_incident(
+    incident_id: str,
+    request: ResolveIncidentRequest,
+):
+    object_id = get_object_id(incident_id)
+
+    update = {
+        "status": "resolved",
+        "root_cause": request.root_cause,
+        "resolution": request.resolution,
+        "verification_notes": request.verification_notes,
+        "resolved_at": utc_now(),
+        "updated_at": utc_now(),
+    }
+
+    result = incidents.update_one(
+        {"_id": object_id},
+        {"$set": update},
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Incident not found.",
+        )
+
+    document = incidents.find_one({"_id": object_id})
+
+    return {
+        "message": "Incident marked as resolved.",
+        "incident": serialize_incident(document),
+    }
+
+
+# ---------------------------------------------------------
+# DELETE INCIDENT
+# ---------------------------------------------------------
+
+@app.delete("/incidents/{incident_id}")
+def delete_incident(incident_id: str):
+    object_id = get_object_id(incident_id)
+
+    result = incidents.delete_one({"_id": object_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Incident not found.",
+        )
+
+    return {
+        "message": "Incident deleted.",
+        "incident_id": incident_id,
+    }
+
+
+# ---------------------------------------------------------
+# HARNESS: EVALUATE POSSIBLE IMPROVEMENT
+# ---------------------------------------------------------
+
+@app.post("/harness/evaluate")
+def evaluate_harness(
+    request: HarnessEvaluationRequest,
+):
+    metrics = {
+        "sample_size": request.sample_size,
+        "memory_helpfulness_rate": (
+            request.memory_helpfulness_rate
+        ),
+    }
+
+    proposal = propose_improvement(metrics)
+
+    evaluation_document = {
+        "metrics": metrics,
+        "proposal_created": proposal.get(
+            "proposal_created", False
+        ),
+        "proposal_result": proposal,
+        "created_at": utc_now(),
+    }
+
+    evaluation_result = harness_evaluations.insert_one(
+        evaluation_document
+    )
+
+    response = {
+        "evaluation_id": str(evaluation_result.inserted_id),
+        "proposal_created": proposal.get(
+            "proposal_created", False
+        ),
+        "proposal_result": proposal,
+    }
+
+    if proposal.get("proposal_created"):
+        proposal_document = {
+            "status": "proposed",
+            "rationale": proposal["rationale"],
+            "sample_size": proposal["sample_size"],
+            "metrics": proposal["metrics"],
+            "current_policy_version": (
+                proposal["current_policy_version"]
+            ),
+            "candidate_policy": proposal["candidate_policy"],
+            "validation": proposal["validation"],
+            "requires_human_approval": True,
+            "automatically_activated": False,
+            "created_at": utc_now(),
+        }
+
+        insert_result = harness_proposals.insert_one(
+            proposal_document
+        )
+
+        response["proposal_id"] = str(
+            insert_result.inserted_id
+        )
+
+    return response
+
+
+# ---------------------------------------------------------
+# HARNESS: LIST PROPOSALS
+# ---------------------------------------------------------
+
+@app.get("/harness/proposals")
+def list_harness_proposals():
+    documents = list(
+        harness_proposals.find()
+        .sort("created_at", DESCENDING)
+        .limit(100)
+    )
+
+    return {
+        "count": len(documents),
+        "proposals": [
+            serialize_document(document)
+            for document in documents
+        ],
+    }
+
+
+# ---------------------------------------------------------
+# HARNESS: APPROVE PROPOSAL
+# ---------------------------------------------------------
+
+@app.post("/harness/proposals/{proposal_id}/approve")
+def approve_harness_proposal(proposal_id: str):
+    object_id = get_object_id(proposal_id)
+
+    proposal = harness_proposals.find_one(
+        {"_id": object_id}
+    )
+
+    if not proposal:
+        raise HTTPException(
+            status_code=404,
+            detail="Harness proposal not found.",
+        )
+
+    if proposal.get("status") != "proposed":
+        raise HTTPException(
+            status_code=409,
+            detail="Only proposed items can be approved.",
+        )
+
+    candidate = proposal.get("candidate_policy")
+
+    if not isinstance(candidate, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Candidate policy is missing or invalid.",
+        )
+
+    validation = validate_policy(candidate)
+
+    if not validation["valid"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Candidate policy failed validation.",
+                "errors": validation["errors"],
+            },
+        )
+
+    result = harness_proposals.update_one(
+        {
+            "_id": object_id,
+            "status": "proposed",
+        },
+        {
+            "$set": {
+                "status": "approved",
+                "approved_at": utc_now(),
+                "approval_validation": validation,
+            }
+        },
+    )
+
+    if result.modified_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Proposal changed. Reload and try again.",
+        )
+
+    return {
+        "status": "approved",
+        "proposal_id": proposal_id,
+        "candidate_policy_version": candidate["version"],
+        "current_policy_version": proposal.get(
+            "current_policy_version"
+        ),
+        "approval_validation": validation,
+        "message": (
+            "Approval recorded. The policy is not active yet."
+        ),
+    }
+
+
+# ---------------------------------------------------------
+# HARNESS: GET ACTIVE POLICY
+# ---------------------------------------------------------
+
+@app.get("/harness/policy/active")
+def get_active_policy():
+    try:
+        document = get_or_create_active_policy()
+
+        return {
+            "version": document["version"],
+            "policy": document["policy"],
+            "updated_at": document["updated_at"].isoformat(),
+            "activated_from_proposal": document.get(
+                "activated_from_proposal"
+            ),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("Could not load active policy")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not load the active policy.",
+        )
+
+
+# ---------------------------------------------------------
+# HARNESS: ACTIVATE APPROVED POLICY
+# ---------------------------------------------------------
+
+@app.post("/harness/proposals/{proposal_id}/activate")
+def activate_harness_proposal(proposal_id: str):
+    object_id = get_object_id(proposal_id)
+
+    try:
+        active_document = get_or_create_active_policy()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Could not initialize active policy")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not initialize the active policy.",
+        )
+
+    proposal = harness_proposals.find_one(
+        {"_id": object_id}
+    )
+
+    if not proposal:
+        raise HTTPException(
+            status_code=404,
+            detail="Harness proposal not found.",
+        )
+
+    if proposal.get("status") != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail="Only approved proposals can be activated.",
+        )
+
+    candidate = proposal.get("candidate_policy")
+
+    if not isinstance(candidate, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Candidate policy is missing or invalid.",
+        )
+
+    validation = validate_policy(candidate)
+
+    if not validation["valid"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Candidate policy failed validation.",
+                "errors": validation["errors"],
+            },
+        )
+
+    current_version = active_document["version"]
+
+    if proposal.get("current_policy_version") != current_version:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Proposal is based on a different policy version. "
+                "Create and review a new proposal."
+            ),
+        )
+
+    if candidate.get("version") != current_version + 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Candidate version must be the next version.",
+        )
+
+    now = utc_now()
+
+    # Compare-and-set prevents overwriting a newer policy version.
+    update_result = active_policies.update_one(
+        {
+            "_id": "active",
+            "version": current_version,
+        },
+        {
+            "$set": {
+                "policy": candidate,
+                "version": candidate["version"],
+                "updated_at": now,
+                "activated_from_proposal": proposal_id,
+            }
+        },
+    )
+
+    if update_result.modified_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Active policy changed during activation. "
+                "Reload the active policy before retrying."
+            ),
+        )
+
+    proposal_update = harness_proposals.update_one(
+        {
+            "_id": object_id,
+            "status": "approved",
+        },
+        {
+            "$set": {
+                "status": "activated",
+                "activated_at": now,
+            }
+        },
+    )
+
+    if proposal_update.modified_count != 1:
+        logger.error(
+            "Policy updated, but proposal status update failed: %s",
+            proposal_id,
+        )
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Policy may already be active, but proposal status "
+                "was not updated. Check the active policy before "
+                "retrying."
+            ),
+        )
+
+    return {
+        "status": "activated",
+        "proposal_id": proposal_id,
+        "active_version": candidate["version"],
+        "message": (
+            "Policy saved in the active registry. "
+            "The investigation agent still needs to load this "
+            "registry for the policy to affect investigations."
+        ),
+    }

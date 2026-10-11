@@ -1,0 +1,162 @@
+
+import os
+
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
+
+def check_mongodb_connectivity() -> dict:
+    """
+    Perform a real, read-only MongoDB connectivity check.
+
+    This verifies connectivity only. It does not prove that MongoDB
+    caused an application incident.
+    """
+    load_dotenv()
+
+    mongodb_uri = os.getenv("MONGODB_URI")
+
+    if not mongodb_uri:
+        return {
+            "tool": "check_mongodb_connectivity",
+            "simulated": False,
+            "status": "not_configured",
+            "finding": (
+                "MongoDB connectivity could not be checked because "
+                "MONGODB_URI is not configured."
+            ),
+        }
+
+    try:
+        with MongoClient(
+            mongodb_uri,
+            serverSelectionTimeoutMS=3000,
+            connectTimeoutMS=3000,
+        ) as client:
+            result = client.admin.command("ping")
+
+        ping_ok = result.get("ok") == 1.0
+
+        return {
+            "tool": "check_mongodb_connectivity",
+            "simulated": False,
+            "status": "connected" if ping_ok else "unhealthy",
+            "evidence": {
+                "ping_ok": ping_ok,
+            },
+            "finding": (
+                "MongoDB responded to a real ping."
+                if ping_ok
+                else "MongoDB ping returned an unexpected result."
+            ),
+        }
+
+    except (PyMongoError, ValueError) as exc:
+        # Do not return the exception message because it could expose
+        # connection details or other sensitive information.
+        return {
+            "tool": "check_mongodb_connectivity",
+            "simulated": False,
+            "status": "unavailable",
+            "error_type": type(exc).__name__,
+            "finding": (
+                "MongoDB connectivity check failed. "
+                "Verify database availability and connection settings."
+            ),
+        }
+
+
+def check_kafka_lag(lag: int) -> dict:
+    """Classify a supplied Kafka lag value."""
+
+    if lag >= 10_000:
+        status = "critical"
+        finding = "Kafka consumer lag is very high."
+    elif lag >= 1_000:
+        status = "warning"
+        finding = "Kafka consumer lag is elevated."
+    else:
+        status = "normal"
+        finding = (
+            "Kafka consumer lag is within the prototype's normal range."
+        )
+
+    return {
+        "tool": "check_kafka_lag",
+        "simulated": True,
+        "status": status,
+        "lag": lag,
+        "finding": finding,
+    }
+
+
+def inspect_incident(service: str, problem: str) -> dict:
+    """
+    Gather diagnostic evidence for a supported service.
+
+    MongoDB connectivity is checked against the configured database.
+    Kafka lag classification remains simulated until a real Kafka
+    monitoring integration is added.
+    """
+
+    service_name = service.strip().lower()
+    description = problem.lower()
+
+    if service_name == "kafka-consumer":
+        if "10000" in description or "10,000" in description:
+            return check_kafka_lag(10_000)
+
+        if "1000" in description or "1,000" in description:
+            return check_kafka_lag(1_000)
+
+        if "lag" in description:
+            return check_kafka_lag(100)
+
+        return {
+            "tool": "inspect_incident",
+            "simulated": True,
+            "status": "unknown",
+            "finding": (
+                "No numeric Kafka lag was supplied. "
+                "Check consumer lag, processing rate, and broker health."
+            ),
+        }
+
+    if service_name == "payment-service":
+        database_check = check_mongodb_connectivity()
+
+        return {
+            "tool": "inspect_incident",
+            "simulated": False,
+            "status": "unknown",
+            "database_connectivity": database_check,
+            "finding": (
+                "A real MongoDB connectivity check was performed. "
+                "This does not establish whether MongoDB caused the "
+                "payment incident. Payment-service logs, latency, "
+                "error rates, and query performance still need checking."
+            ),
+        }
+
+    if service_name == "api-service":
+        return {
+            "tool": "inspect_incident",
+            "simulated": True,
+            "status": "unknown",
+            "finding": (
+                "No API telemetry is connected. "
+                "Check HTTP 5xx rate, latency, request volume, and logs."
+            ),
+        }
+
+    return {
+        "tool": "inspect_incident",
+        "simulated": True,
+        "status": "unknown",
+        "finding": (
+            "This service is not configured. "
+            "Add a service-specific diagnostic tool before drawing "
+            "conclusions."
+        ),
+    }

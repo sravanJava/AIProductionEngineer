@@ -1,0 +1,103 @@
+from copy import deepcopy
+
+
+BASE_POLICY = {
+    "version": 1,
+    "max_tool_calls": 1,
+    "require_evidence": True,
+    "require_human_approval_for_mutations": True,
+    "allowed_tools": ["inspect_incident"],
+    "context_policy": {
+        "include_similar_resolved_incidents": True,
+        "max_memory_items": 3,
+        "include_raw_secrets": False,
+    },
+    "output_policy": {
+        "require_observed_facts": True,
+        "require_possible_causes": True,
+        "require_next_steps": True,
+        "require_uncertainty": True,
+    },
+}
+
+
+def build_task_policy(service: str) -> dict:
+    """Build a bounded policy for the type of incident."""
+    policy = deepcopy(BASE_POLICY)
+    service_name = service.strip().lower()
+
+    if service_name == "kafka-consumer":
+        policy["task_type"] = "kafka_incident"
+        policy["investigation_focus"] = [
+            "consumer lag",
+            "processing rate",
+            "broker health",
+        ]
+    elif service_name == "payment-service":
+        policy["task_type"] = "database_or_payment_incident"
+        policy["investigation_focus"] = [
+            "dependency health",
+            "error rate",
+            "latency",
+            "logs",
+        ]
+    elif service_name == "api-service":
+        policy["task_type"] = "api_incident"
+        policy["investigation_focus"] = [
+            "HTTP 5xx rate",
+            "latency",
+            "request volume",
+            "dependency health",
+        ]
+    else:
+        policy["task_type"] = "unknown_service"
+        policy["investigation_focus"] = [
+            "identify the service",
+            "connect an approved diagnostic tool",
+        ]
+
+    return policy
+
+
+def validate_policy(candidate: dict) -> dict:
+    """Reject policies that exceed the trusted safety boundaries."""
+    errors = []
+
+    allowed_tools = set(BASE_POLICY["allowed_tools"])
+    requested_tools = candidate.get("allowed_tools", [])
+
+    if not isinstance(requested_tools, list):
+        errors.append("allowed_tools must be a list.")
+    elif not set(requested_tools).issubset(allowed_tools):
+        errors.append("The policy requested an unapproved tool.")
+
+    calls = candidate.get("max_tool_calls")
+    if (
+        not isinstance(calls, int)
+        or isinstance(calls, bool)
+        or not 1 <= calls <= BASE_POLICY["max_tool_calls"]
+    ):
+        errors.append("max_tool_calls must be exactly 1.")
+
+    if candidate.get("require_evidence") is not True:
+        errors.append("The evidence requirement cannot be disabled.")
+
+    if candidate.get("require_human_approval_for_mutations") is not True:
+        errors.append("Mutation approval cannot be disabled.")
+
+    context = candidate.get("context_policy", {})
+    if context.get("include_raw_secrets") is not False:
+        errors.append("Raw secrets must not be included in model context.")
+
+    memory_limit = context.get("max_memory_items")
+    if (
+        not isinstance(memory_limit, int)
+        or isinstance(memory_limit, bool)
+        or not 0 <= memory_limit <= 3
+    ):
+        errors.append("Memory must be limited to 0–3 incidents.")
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+    }
